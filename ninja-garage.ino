@@ -12,8 +12,8 @@
 #include <MQTT.h>
 #include <ArduinoJson.h>
 
-#define SENSOR_PIN D1
-#define RELAY_PIN D2
+#define SENSOR_PIN D2
+#define RELAY_PIN D1
 
 #define RELAY_PULSE 500
 
@@ -48,7 +48,10 @@ void saveConfigCallback(){
 }
 
 void setup(){
-Serial.begin(115200);
+
+    pinMode(SENSOR_PIN, INPUT);
+
+    Serial.begin(115200);
     if(SPIFFS.begin()){
         Serial.println("mounted fs");
         if(SPIFFS.exists("/config.json")){
@@ -140,5 +143,8 @@ void loop(){
     Serial.print("Door move time: ");
     Serial.println(door_move_time);
     Serial.print("Sensor bounce time: ");
-    Serial.print(sensor_bounce_time);
+    Serial.println(sensor_bounce_time);
+    Serial.print("Door sensor state: ");
+    Serial.println(digitalRead(SENSOR_PIN));
+    delay(2000);
 }
