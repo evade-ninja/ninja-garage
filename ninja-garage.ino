@@ -1,150 +1,410 @@
 // ninja-garage - an MQTT based garage door opener
 // (c) 2020
 
+//#define ESP8266
+#define DEBUG
+
 #include <FS.h>
-#include <ESP8266WiFi.h>
-#include <WiFiClient.h>
-#include <ESP8266WebServer.h>
-#include <ESP8266mDNS.h>
-#include <FS.h>
-#include <DNSServer.h>
+#include <LittleFS.h>
 #include <WiFiManager.h>
-#include <MQTT.h>
 #include <ArduinoJson.h>
+#include "Adafruit_MQTT.h"
+#include "Adafruit_MQTT_Client.h"
 
-#define SENSOR_PIN D2
-#define RELAY_PIN D1
+//Pin Definitions
+#define SENSOR_PIN 19
+#define RELAY_PIN 20
+#define LED_BUILTIN 17
 
+//Magic Numbers
 #define RELAY_PULSE 500
-
 #define CONFIG_TIMEOUT 180
+#define MQTT_QOS 1
 
-#define DOOR_OPEN 0
-#define DOOR_CLOSED 1
+//Door States
+#define DOOR_OPEN 1
+#define DOOR_CLOSED 0
 #define DOOR_OPENING 2
 #define DOOR_CLOSING 3
 
-const char* device_name = "NINJA-DOOR";
+//Global Variables
 
 int door_state = DOOR_CLOSED;
 int door_new_state = DOOR_CLOSED;
+boolean door_state_changed = false;
+unsigned long door_state_change_time = 0;
+bool shouldSaveConfig = false;
 
 //VARIABLES STORED IN FS
 
-char mqtt_server[40];
-char t_dmt[10];
-char t_sbt[10];
-
-unsigned long door_state_change_time = 0;
+char mqtt_server[64];
+uint16_t mqtt_port = 1883;
+char mqtt_set_target_door[96];
+char mqtt_get_target_door[96];
+char mqtt_get_current_door[96];
+char mdns_name[32];
 int door_move_time = 15000;
-int sensor_bounce_time = 2000;
+int sensor_bounce_time = 1000;
+char mqtt_payload_open[16];
+char mqtt_payload_closed[16];
+char mqtt_payload_opening[16];
+char mqtt_payload_closing[16];
 
+//WiFi Manager
+WiFiManager wm;
+//bool wm_nonblocking = true;
+WiFiManagerParameter param_mqtt_server("mqtt_server", "MQTT Server", mqtt_server, 64);
+WiFiManagerParameter param_mqtt_port("mqtt_port", "MQTT Port", "1883", 6);
+WiFiManagerParameter param_mqtt_set_target_door("mqtt_set_target_door", "MQTT Set Target Door", mqtt_set_target_door, 96);
+WiFiManagerParameter param_mqtt_get_target_door("mqtt_get_target_door", "MQTT Get Target Door", mqtt_get_target_door, 96);
+WiFiManagerParameter param_mqtt_get_current_door("mqtt_get_current_door", "MQTT Get Current Door", mqtt_get_current_door, 96);
+WiFiManagerParameter param_mdns_name("mdns_name", "MDNS Name", mdns_name, 32);
+WiFiManagerParameter param_mqtt_payload_open("mqtt_payload", "Payload: Open", mqtt_payload_open, 16);
+WiFiManagerParameter param_mqtt_payload_closed("mqtt_payload", "Payload: Closed", mqtt_payload_closed, 16);
+WiFiManagerParameter param_mqtt_payload_opening("mqtt_payload", "Payload: Opening", mqtt_payload_opening, 16);
+WiFiManagerParameter param_mqtt_payload_closing("mqtt_payload", "Payload: Closing", mqtt_payload_closing, 16);
+WiFiManagerParameter param_door_move_time("door_move_time", "Door Move Time (ms)", "15000", 16);
+WiFiManagerParameter param_sensor_bounce_time("sensor_bounce", "Sensor Bounce Time (ms)", "1000", 16);
 
-bool shouldSaveConfig = false;
+WiFiClient client;
+
+Adafruit_MQTT_Client mqtt_client;
+
+Adafruit_MQTT_Subscribe mqtts_set_target_door;
+
 
 void saveConfigCallback(){
     Serial.println("Should save config!");
     shouldSaveConfig = true;
 }
 
-void setup(){
+void setup() {
+  // put your setup code here, to run once:
+  Serial.begin(115200);
+  Serial.setDebugOutput(true);
+  delay(3000);
+  Serial.println("\nStarting");
 
-    pinMode(SENSOR_PIN, INPUT);
+  pinMode(SENSOR_PIN, INPUT);
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, HIGH);
 
-    Serial.begin(115200);
-    if(SPIFFS.begin()){
-        Serial.println("mounted fs");
-        if(SPIFFS.exists("/config.json")){
-            Serial.println("reading config");
-            File configFile = SPIFFS.open("/config.json", "r");
-            if(configFile){
-                Serial.println("opened config");
-                size_t size = configFile.size();
+  bool needConf = false;
 
-                std::unique_ptr<char[]> buf(new char[size]);
-                configFile.readBytes(buf.get(), size);
-                DynamicJsonDocument json(1024);
-                DeserializationError deserializeError = deserializeJson(json, buf.get());
-                serializeJson(json, Serial);
-                //DynamicJsonBuffer = jsonBuffer;
-                //JsonObject& json = jsonBuffer.parseObject(buf.get());
-                serializeJsonPretty(json, Serial);
+  unsigned long configstart = millis();
 
-                if (!deserializeError) {
-                    Serial.println("\nparsed json");
-
-                    strcpy(mqtt_server, json["mqtt_server"]);
-                    //strcpy(t_dsct, json["dsct"]);
-                    strcpy(t_dmt, json["dmt"]);
-                    strcpy(t_sbt, json["sbt"]);
-                }else{
-                    Serial.println("failed to load config");
-                }
-                configFile.close();
-            }
-        }
-    }else{
-        Serial.println("failed to mount fs");
-    }
-
-    WiFiManagerParameter c_mqtt_server("server", "mqtt server", mqtt_server, 40);
-    WiFiManagerParameter c_dmt("dmt", "time for door to move", t_dmt, 10);
-    WiFiManagerParameter c_sbt("sbt", "Bounce time", t_sbt, 10);
-
-    WiFiManager wifiManager;
-
-    wifiManager.setSaveConfigCallback(saveConfigCallback);
-    //wifiManager.setSTAStaticIPConfig(IPAddress(10,0,1,99), IPAddress(10,0,1,1), IPAddress(255,255,255,0));
-
-    wifiManager.addParameter(&c_mqtt_server);
-    wifiManager.addParameter(&c_dmt);
-    wifiManager.addParameter(&c_sbt);
-
-    wifiManager.setTimeout(300);
-
-    if(!wifiManager.autoConnect(device_name)){
-        Serial.println("failed to connect and hit timeout");
-        delay(3000);
-        ESP.reset();
-        delay(5000);
-    }
-
-    Serial.println("connected!");
-
-    //read updated parameters
-
-    strcpy(mqtt_server, c_mqtt_server.getValue());
-    strcpy(t_dmt, c_dmt.getValue());
-    strcpy(t_sbt, c_sbt.getValue());
-
-    door_move_time = atoi(t_dmt);
-    sensor_bounce_time = atoi(t_sbt);
-
-    if(shouldSaveConfig){
-        Serial.println("saving config");
+  Serial.println("Looking for button press to enter config mode:");
+  
+  WiFi.mode(WIFI_STA);
+  
+  if(LittleFS.begin()){
+    if(LittleFS.open("/config.json", "r")){
+      File configFile = LittleFS.open("/config.json", "r");
+      if(configFile){
+        size_t size = configFile.size();
+        std::unique_ptr<char[]> buf(new char[size]);
+        configFile.readBytes(buf.get(), size);
         DynamicJsonDocument json(1024);
-        json["mqtt_server"] = mqtt_server;
-        json["dmt"] = t_dmt;
-        json["sbt"] = t_sbt;
+        auto deserializeError = deserializeJson(json, buf.get());
+        serializeJson(json, Serial);
+        if ( ! deserializeError ) {
+          #ifdef DEBUG
+          Serial.println("\nparsed json");
+          #endif
+          
+          strcpy(mqtt_server, json["mqtt_server"]);
+          mqtt_port = atoi(json["mqtt_port"]);
+          strcpy(mqtt_set_target_door, json["mqtt_set_target_door"]);
+          strcpy(mqtt_get_target_door, json["mqtt_get_target_door"]);
+          strcpy(mqtt_get_current_door, json["mqtt_get_current_door"]);
+          
+          strcpy(mdns_name, json["mdns_name"]);
 
-        File configFile = SPIFFS.open("/config.json", "w");
-        if(!configFile){
-            Serial.println("failed to open for writing");
+          door_move_time = atoi(json["door_move_time"]);
+          sensor_bounce_time = atoi(json["sensor_bounce_time"]);
+
+          strcpy(mqtt_payload_open, json["mqtt_payload_open"]);
+          strcpy(mqtt_payload_closed, json["mqtt_payload_closed"]);
+          strcpy(mqtt_payload_opening, json["mqtt_payload_opening"]);
+          strcpy(mqtt_payload_closing, json["mqtt_payload_closing"]);
+          
+          #ifdef DEBUG
+          Serial.println("Variables as read from flash:");
+          Serial.println(mqtt_server);
+          Serial.println(mqtt_port);
+          Serial.println(mqtt_set_target_door);
+          Serial.println(mqtt_get_target_door);
+          Serial.println(mqtt_get_current_door);
+          Serial.println(door_move_time);
+          Serial.println(mdns_name);
+          Serial.println(door_move_time);
+          Serial.println(sensor_bounce_time);
+          Serial.println(mqtt_payload_open);
+          Serial.println(mqtt_payload_closed);
+          Serial.println(mqtt_payload_opening);
+          Serial.println(mqtt_payload_closing);
+          #endif
+
+        } else {
+          Serial.println("failed to load json config");
+          needConf = true;
         }
+      }
 
-        serializeJsonPretty(json, Serial);
-        serializeJson(json, configFile);
-        configFile.close();
+      
     }
+    else{
+      //no config file!
+      Serial.println("No config file - but we can create it!");
+      needConf = true;
+    }
+  }
+  else{
+    Serial.println("failed to mount FS. RIP ESP8266");
+  }
 
+  wm.setCountry("US");
+  wm.setConfigPortalBlocking(true);
+
+  //Convert ints to strings
+  char mport[8];
+  itoa(mqtt_port, mport, 10);
+
+  char dmt[8];
+  itoa(door_move_time, dmt, 10);
+
+  char sbt[8];
+  itoa(sensor_bounce_time, sbt, 10);
+
+  wm.addParameter(&param_mqtt_server);
+  wm.addParameter(&param_mqtt_port);
+  wm.addParameter(&param_mqtt_set_target_door);
+  wm.addParameter(&param_mqtt_get_target_door);
+  wm.addParameter(&param_mqtt_get_current_door);
+  wm.addParameter(&param_mdns_name);
+  wm.addParameter(&param_door_move_time);
+  wm.addParameter(&param_sensor_bounce_time);
+  wm.addParameter(&param_mqtt_payload_open);
+  wm.addParameter(&param_mqtt_payload_closed);
+  wm.addParameter(&param_mqtt_payload_opening);
+  wm.addParameter(&param_mqtt_payload_closing);
+
+  param_mqtt_server.setValue(mqtt_server, 64);
+  param_mqtt_port.setValue(mport, 6);
+  param_mqtt_set_target_door.setValue(mqtt_set_target_door, 96);
+  param_mqtt_get_target_door.setValue(mqtt_get_target_door, 96);
+  param_mqtt_get_current_door.setValue(mqtt_get_current_door, 96);
+  param_mdns_name.setValue(mdns_name, 32);
+  param_door_move_time.setValue(dmt, 16);
+  param_sensor_bounce_time.setValue(sbt, 16);
+
+  wm.setSaveParamsCallback(saveParamConfigCallback);
+
+  std::vector<const char *> menu = {"wifi","info","param","sep","restart","exit"};
+  wm.setMenu(menu);
+
+  wm.setClass("invert");
+
+  wm.setParamsPage(true);
+  wm.setConfigPortalTimeout(240);
+  wm.setBreakAfterConfig(true);
+  wm.setAPClientCheck(true);
+  wm.setRemoveDuplicateAPs(true);
+  wm.setHostname(mdns_name);
+  wm.setSaveConfigCallback(saveConfigCallback);
+  wm.setSaveParamsCallback(saveParamConfigCallback);
+
+  bool res;
+
+  if(needConf){
+    //show the config screen
+    wm.startConfigPortal("ConfigureME", "espconfig4me");
+    digitalWrite(LED_BUILTIN, LOW);
+    delay(10000);
+    ESP.restart();    
+  }else{
+    #ifdef DEBUG
+    Serial.println("Autoconnecting");
+    #endif
+    res = wm.autoConnect("ConfgureME", "espconfig4me");
+  
+    if(!res) {
+      #ifdef DEBUG
+      Serial.println("Failed to connect or hit timeout");
+      #endif
+      ESP.restart();
+    }else{
+      #ifdef DEBUG
+      Serial.println("Connected!");
+      #endif
+      
+    }
+  }
+
+  #ifdef DEBUG
+  Serial.println("Variables in memory:");
+  Serial.print("Door move time: ");
+  Serial.println(door_move_time);
+  Serial.print("Sensor bounce time: ");
+  Serial.println(sensor_bounce_time);
+  Serial.println(mqtt_server);
+  Serial.println(mqtt_port);
+  Serial.println(mqtt_set_target_door);
+  Serial.println(mqtt_get_target_door);
+  Serial.println(mqtt_get_current_door);
+  Serial.println(mdns_name);
+  Serial.println(door_move_time);
+  Serial.println(mqtt_payload_open);
+  Serial.println(mqtt_payload_closed);
+  Serial.println(mqtt_payload_opening);
+  Serial.println(mqtt_payload_closing);
+  #endif
+
+  //connect MQTT client
+  mqtt_client = Adafruit_MQTT_Client(&client, mqtt_server, mqtt_port, "","");
+  mqtts_set_target_door = Adafruit_MQTT_Subscribe(&mqtt_client, mqtt_set_target_door, MQTT_QOS_1);
+  mqtts_set_target_door.setCallback(doorCMD);
+}
+
+
+String getParam(String name){
+  String value;
+  if(wm.server->hasArg(name)) {
+    value = wm.server->arg(name);
+  }
+  return value;
+}
+
+void saveConfigCallback () {
+  saveParams();
+}
+
+void saveParamConfigCallback () {
+  saveParams();
+  wm.stopConfigPortal();
+}
+
+void saveParams(){
+  //Save config to flash
+  #ifdef DEBUG
+  Serial.println("saving config to flash");
+  #endif
+  DynamicJsonDocument json(1024);
+  json["mqtt_server"] = getParam("mqtt_server");
+  json["mqtt_port"] = getParam("mqtt_port");
+  json["mdns_name"] = getParam("mdns_name");
+  json["mqtt_set_target_door"] = getParam("mqtt_set_target_door");
+  json["mqtt_get_target_door"] = getParam("mqtt_get_target_door");
+  json["mqtt_get_current_door"] = getParam("mqtt_get_current_door");
+  json["door_move_time"] = getParam("door_move_time");
+  json["sensor_bounce_time"] = getParam("sensor_bounce_time");
+  json["mqtt_payload_open"] = getParam("mqtt_payload_open");
+  json["mqtt_payload_closed"] = getParam("mqtt_payload_closed");
+  json["mqtt_payload_opening"] = getParam("mqtt_payload_opening");
+  json["mqtt_payload_closing"] = getParam("mqtt_payload_closed");
+
+  //Save config to running variables
+  strcpy(mqtt_server, json["mqtt_server"]);
+  mqtt_port = atoi(json["mqtt_port"]);
+  strcpy(mdns_name, json["mdns_name"]);
+  door_move_time = atoi(json["door_move_time"]);
+  sensor_bounce_time = atoi(json["sensor_bounce_time"]);
+  strcpy(mqtt_set_target_door, json["mqtt_set_target_door"]);
+  strcpy(mqtt_get_target_door, json["mqtt_get_target_door"]);
+  strcpy(mqtt_get_current_door, json["mqtt_get_current_door"]);
+  strcpy(mqtt_payload_open, json["mqtt_payload_open"]);
+  strcpy(mqtt_payload_closed, json["mqtt_payload_closed"]);
+  strcpy(mqtt_payload_opening, json["mqtt_payload_opening"]);
+  strcpy(mqtt_payload_closing, json["mqtt_payload_closing"]);
+
+  File configFile = LittleFS.open("/config.json", "w");
+  if (!configFile) {
+    #ifdef DEBUG
+    Serial.println("failed to open config file for writing");
+    #endif
+  }
+
+  serializeJson(json, Serial);
+  serializeJson(json, configFile);
+  configFile.close();
+  //end save -
+}
+
+void connectMQTT(){
+  if(mqtt_client.connected()){
+    return;
+  }
+
+  int8_t ret;
+  uint8_t retries = 3;
+
+  while(mqtt_client.connect() != 0){
+    #ifdef DEBUG
+    Serial.print("MQTT Connection error: ");
+    Serial.println(mqtt_client.connectErrorString(ret));
+    #endif
+    mqtt_client.disconnect();
+    delay(10000);
+    retries--;
+    if(retries == 0){
+      while(1);
+    }
+  }
+  #ifdef DEBUG
+  Serial.println("MQTT Connected!");
+  #endif
+}
+
+void doorCMD(char *data, uint16_t len){
+  //Process a door command recieved via MQTT subscription
+  #ifdef DEBUG
+  Serial.print("Recieved MQTT CMD:");
+  Serial.println(data);
+  #endif
 }
 
 void loop(){
-    Serial.print("Door move time: ");
-    Serial.println(door_move_time);
-    Serial.print("Sensor bounce time: ");
-    Serial.println(sensor_bounce_time);
-    Serial.print("Door sensor state: ");
-    Serial.println(digitalRead(SENSOR_PIN));
-    delay(2000);
+  connectMQTT();
+  readDoor();
+  mqtt_client.processPackets(10000);
+
+  if(! mqtt_client.ping()){
+    mqtt_client.disconnect();
+  }
+}
+
+void readDoor(){
+    int door = digitalRead(SENSOR_PIN);
+
+    if(door != door_new_state){
+      #ifdef DEBUG
+      Serial.print("Door state changed, now ");
+      Serial.println(door);
+      #endif
+      door_new_state = door;
+      door_state_change_time = millis();
+      door_state_changed = false; //clear the flag
+    }else{
+      if(door_new_state != door_state && (sensor_bounce_time + door_state_change_time > millis()) && !door_state_changed ){
+        //state trying to change 
+        door_state = door_new_state;
+        door_state_changed = true;
+          
+        //publish the state change
+        publishState();
+        }
+    }
+}
+
+void publishState(){
+  door_state;
+
+  if(door_state == DOOR_OPEN){
+    mqtt_client.publish(mqtt_get_current_door, mqtt_payload_open, MQTT_QOS);
+  }
+
+  if(door_state == DOOR_CLOSED){
+    mqtt_client.publish(mqtt_get_current_door, mqtt_payload_closed, MQTT_QOS);
+  }
+
 }
